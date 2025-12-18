@@ -1,0 +1,38 @@
+# Python cache
+__pycache__/
+*.py[cod]
+Depth-Anything-3/
+Depth-Anything-3/
+# Distribution / packaging
+workspace/
+build/
+dist/
+*.egg-info/
+.gradio/
+output/
+data/ 
+checkpoints/git remote add origin git@github.com:khaterma/Pose-check.git
+# Test/coverage
+.coverage
+.pytest_cache/
+htmlcov/
+.tox/
+gallery*/
+debug*/
+DA3HF*/
+gradio_workspace/
+eval_workspace/
+FILTER*/
+input_images*/
+*.gradio/
+
+# Jupyter notebooks
+.ipynb_checkpoints
+
+# OS files
+.DS_Store
+
+.vscode
+src/debug_main.py
+temp*.png
+/outputs
