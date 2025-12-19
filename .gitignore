@@ -2,7 +2,8 @@
 __pycache__/
 *.py[cod]
 Depth-Anything-3/
-Depth-Anything-3/
+
+checkpoints/
 # Distribution / packaging
 workspace/
 build/
@@ -25,6 +26,9 @@ eval_workspace/
 FILTER*/
 input_images*/
 *.gradio/
+files/
+Depth-Anything-3/
+*.pt
 
 # Jupyter notebooks
 .ipynb_checkpoints
