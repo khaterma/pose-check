@@ -64,6 +64,7 @@ class BodyReconstructionPipeline:
         
         # Step 1: Depth Estimation
         depth_map, processed_image, cam_intrinsics = self._estimate_depth_and_fov(image_path)
+        self.cam_intrinsics = cam_intrinsics
         
         # Step 2: 2D Pose Detection
         keypoints_2d = self._detect_pose_2d(image_path, processed_image)
@@ -225,6 +226,7 @@ class BodyReconstructionPipeline:
         points, colors = project_to_3d(
             depth_map=depth_map,
             img_rgb=rgb_image,
+            camera_intrinsics=self.cam_intrinsics,
             center_around_origin=True
         )
         
@@ -278,16 +280,19 @@ class BodyReconstructionPipeline:
             final_params = fitter.fit(
                 keypoints_2d=keypoints_2d,
                 cam_intrinsics=cam_intrinsics.cpu().numpy(),
+                depth_map=depth_map,
+                point_cloud=point_cloud,
+                mask=masks[0].cpu().numpy(),
                 conf_threshold=0.5
             )
             
             # final_params = fitter.optimize_phase2(
             #     depth_map=depth_map,
             #     cam_intrinsics=cam_intrinsics.cpu().numpy(),
-            #     point_cloud=point_cloud,
-            #     masks=masks,
+            #     mask=masks[0].cpu().numpy(),
             #     iterations=200
             # )
+
             # Export meshes
             fitter.export_mesh(os.path.join(self.output_dir, "smplx_fitted.obj"))
             fitter.export_mesh(os.path.join(self.output_dir, "smplx_fitted.ply"))

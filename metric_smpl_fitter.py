@@ -11,6 +11,8 @@ import torch.nn as nn
 import numpy as np
 from typing import Dict, Tuple, Optional
 import smplx
+from pytorch3d.structures import Meshes, Pointclouds
+from pytorch3d.loss import point_mesh_face_distance, chamfer_distance
 
 
 
@@ -161,6 +163,9 @@ class MetricSMPLFitter:
         self,
         keypoints_2d: np.ndarray,
         cam_intrinsics: np.ndarray,
+        depth_map: np.ndarray,
+        mask: np.ndarray,
+        point_cloud: np.ndarray,
         conf_threshold: float = 0.3,
         num_iterations: int = 500,
         lr: float = 0.01,
@@ -185,6 +190,8 @@ class MetricSMPLFitter:
                 'reproj': 100.0,      # Reprojection error
                 'pose_prior': 0.01,   # Pose regularization
                 'shape_prior': 0.1,   # Shape regularization
+                'depth': 0.1,         # Depth supervision
+                'p2mf': 0.1           # Point-to-mesh face distance
             }
         
         print("\n" + "=" * 60)
@@ -202,6 +209,9 @@ class MetricSMPLFitter:
         # Convert to torch
         keypoints_2d_torch = torch.from_numpy(keypoints_2d[:, :2]).float().to(self.device)
         valid_mask_torch = torch.from_numpy(valid_mask).bool().to(self.device)
+        depth_map_torch = torch.from_numpy(depth_map).float().to(self.device)
+        mask_torch = torch.from_numpy(mask.astype(np.bool_)).to(self.device)
+
         
         if cam_intrinsics.ndim == 3:
             cam_intrinsics = cam_intrinsics[0]
@@ -245,15 +255,17 @@ class MetricSMPLFitter:
                 left_hand_pose=left_hand_pose,
                 right_hand_pose=right_hand_pose,
                 expression=expression,
-                return_verts=False
+                return_verts=True
             )
             
             # Get SMPL-X joints
             smpl_joints = output.joints[0]  # [127, 3]
+            vertices = output.vertices[0]  # [V, 3]
             
             # Map to YOLO keypoints and compute reprojection loss
             pred_2d_list = []
             target_2d_list = []
+            
             
             for yolo_idx, smpl_idx in self.keypoint_mapping.items():
                 if not valid_mask_torch[yolo_idx]:
@@ -302,11 +314,40 @@ class MetricSMPLFitter:
             # L_shape: Shape prior (keep betas small)
             loss_shape = torch.mean(betas ** 2)
             
+            # loss_depth = self.compute_depth_loss(
+            #     vertices=vertices,
+            #     cam_intrinsics=cam_intrinsics_torch,
+            #     depth_map=depth_map_torch,
+            #     mask=mask_torch,
+            #     max_verts=3000,
+            #     it=iteration
+            # )
+
+            loss_depth = torch.tensor(0.0).to(self.device)
+            faces = self.smplx_model.faces
+            # print(f"Vertices shape: {vertices.shape}, Faces shape: {faces.shape}")
+            loss_s2m_face = torch.tensor(0.0).to(self.device)
+            if iteration > 300:
+                faces = torch.from_numpy(faces).long().to(self.device)
+
+                mesh = Meshes(verts=[vertices], faces=[faces])
+                # print(f"Mesh has {mesh.num_verts_per_mesh().item()} vertices and {mesh.num_faces_per_mesh().item()} faces.")
+                # print(f"Point cloud shape: {point_cloud.shape}")
+                # point_cloud = torch.from_numpy(point_cloud).float().to(self.device).unsqueeze(0)
+                # point_cloud = pointclouds([torch.from_numpy(point_cloud).float().to(self.device)])
+                pclouds = Pointclouds([torch.from_numpy(point_cloud).float().to(self.device)])
+
+                loss_s2m_face = point_mesh_face_distance(mesh, pclouds)
+                print(f"Loss S2M Face: {loss_s2m_face.item():.4f}")
+            
+            
             # Total loss
             loss = (
                 weights['reproj'] * loss_reproj +
                 weights['pose_prior'] * loss_pose +
-                weights['shape_prior'] * loss_shape
+                weights['shape_prior'] * loss_shape +
+                weights['depth'] * loss_depth + 
+                weights.get('p2mf', 0.0) * loss_s2m_face
             )
             
             # Backward pass
@@ -320,7 +361,8 @@ class MetricSMPLFitter:
                     f"Loss: {loss.item():.4f} | "
                     f"Reproj: {loss_reproj.item():.4f} | "
                     f"Pose: {loss_pose.item():.6f} | "
-                    f"Shape: {loss_shape.item():.6f}"
+                    f"Shape: {loss_shape.item():.6f} | "
+                    f"Depth: {loss_depth.item():.4f}"
                 )
         
         print("\n" + "=" * 60)
@@ -340,6 +382,220 @@ class MetricSMPLFitter:
         
         return self.fitted_params
     
+    
+
+    def compute_depth_loss(
+            self,
+            vertices: torch.Tensor,        # [V, 3]
+            cam_intrinsics: torch.Tensor,  # [3, 3]
+            depth_map: torch.Tensor,       # [H, W]
+            mask: torch.Tensor,            # [H, W]
+            max_verts: int = 3000,
+            it: int = 0
+        ) -> torch.Tensor:
+            """
+            Compute depth loss between projected vertices and depth map.
+            
+            Fixed version with proper tensor indexing.
+            """
+
+            device = vertices.device
+            H, W = depth_map.shape
+
+            
+
+            # fx, fy = cam_intrinsics[0, 0], cam_intrinsics[1, 1]
+            # cx, cy = cam_intrinsics[0, 2], cam_intrinsics[1, 2]
+
+            # ----------------------------------
+            # Project vertices
+            # ----------------------------------
+            # x, y, z = vertices[:, 0], vertices[:, 1], vertices[:, 2]
+
+            # valid = z > 1e-4
+            # x, y, z = x[valid], y[valid], z[valid]
+
+            # if z.numel() == 0:
+            #     return torch.zeros((), device=device)
+
+            # u = (fx * x / z + cx).long()
+            # v = - (fy * y / z + cy).long()
+
+            points = self._project_points(vertices, cam_intrinsics)
+            u = points[:, 0].long()
+            v = points[:, 1].long()
+            z = vertices[:, 2]
+            # Estimate normals (use precomputed faces)
+
+
+            # ----------------------------------
+            # Image bounds check
+            # ----------------------------------
+            inside = (u >= 0) & (u < W) & (v >= 0) & (v < H)
+            u, v, z = u[inside], v[inside], z[inside]
+
+            if z.numel() == 0:
+                return torch.zeros((), device=device)
+
+            # ----------------------------------
+            # Mask filtering (FIXED)
+            # ----------------------------------
+            # Convert to linear indices for consistent indexing
+            linear_idx = v * W + u
+            
+            # Flatten mask for linear indexing
+            mask_flat = mask.reshape(-1)  # [H*W]
+            
+            # Sample mask values using linear indices
+            mask_values = mask_flat[linear_idx]  # shape [N]
+            mask_valid = mask_values > 0.5       # boolean [N]
+
+            u, v, z = u[mask_valid], v[mask_valid], z[mask_valid]
+
+            if z.numel() == 0:
+                return torch.zeros((), device=device)
+
+            # ----------------------------------
+            # Z-buffer (closest vertex per pixel)
+            # ----------------------------------
+            pixel_ids = v * W + u
+            unique_ids, inverse = torch.unique(pixel_ids, return_inverse=True)
+
+            z_min = torch.full((unique_ids.shape[0],), float('inf'), device=device)
+            z_min.scatter_reduce_(0, inverse, z, reduce='amin')
+            z = z_min[inverse]
+            if it % 50 == 0:
+                # save the depth values corresponding to the original pixel_ids and save it as depth.png
+                z = z_min[inverse]
+                print(f"After Z-buffering - z shape: {z.shape}")
+                depth_image = torch.zeros((H * W,), device=device) + float('inf')
+                depth_image[unique_ids] = z_min
+                depth_image = depth_image.reshape(H, W)
+                import matplotlib.pyplot as plt
+                plt.imsave("depth.png", depth_image.detach().cpu().numpy(), cmap='plasma')
+                plt.imsave("depth_debug.png", depth_map.detach().cpu().numpy(), cmap='plasma')
+            # ----------------------------------
+            # Depth lookup (ALSO FIXED for consistency)
+            # ----------------------------------
+            depth_flat = depth_map.reshape(-1)  # [H*W]
+            depth_gt = depth_flat[pixel_ids]    # Use same linear indexing
+
+            loss = torch.mean((z - depth_gt) ** 2)
+            return loss
+
+        
+
+    # def optimize_phase2(
+    #     self,
+    #     depth_map: np.ndarray,        # [H, W] metric depth
+    #     cam_intrinsics: np.ndarray,   # [3, 3]
+    #     mask: np.ndarray,             # [H, W] binary person mask
+    #     iterations: int = 200,
+    #     lr: float = 0.005,
+    # ) -> Dict[str, torch.Tensor]:
+    #     """
+    #     Phase 2: Refine SMPL-X using dense depth supervision
+    #     (masked + Z-buffered vertices only)
+    #     """
+
+    #     device = self.device
+
+    #     # -----------------------------------------
+    #     # Convert inputs to torch
+    #     # -----------------------------------------
+    #     depth_map_torch = torch.from_numpy(depth_map).float().to(device)
+    #     mask_torch = torch.from_numpy(mask.astype(np.bool_)).to(device)
+
+    #     cam_intrinsics_torch = torch.from_numpy(cam_intrinsics).float().to(device)
+
+    #     H, W = depth_map_torch.shape
+
+    #     # -----------------------------------------
+    #     # Optimization variables (start from Phase 1)
+    #     # -----------------------------------------
+    #     transl = self.fitted_params['transl'].clone().requires_grad_(True)
+    #     global_orient = self.fitted_params['global_orient'].clone().requires_grad_(True)
+    #     body_pose = self.fitted_params['body_pose'].clone().requires_grad_(True)
+    #     betas = self.fitted_params['betas'].clone().requires_grad_(True)
+
+    #     left_hand_pose = self.fitted_params['left_hand_pose']
+    #     right_hand_pose = self.fitted_params['right_hand_pose']
+    #     expression = self.fitted_params['expression']
+
+    #     optimizer = torch.optim.Adam(
+    #         [transl, global_orient, body_pose, betas],
+    #         lr=lr
+    #     )
+
+    #     # -----------------------------------------
+    #     # Optimization loop
+    #     # -----------------------------------------
+    #     for it in range(iterations):
+    #         optimizer.zero_grad()
+
+    #         output = self.smplx_model(
+    #             betas=betas,
+    #             global_orient=global_orient,
+    #             body_pose=body_pose,
+    #             transl=transl,
+    #             left_hand_pose=left_hand_pose,
+    #             right_hand_pose=right_hand_pose,
+    #             expression=expression,
+    #             return_verts=True
+    #         )
+
+    #         vertices = output.vertices[0]  # [V, 3]
+
+    #         # -----------------------------------------
+    #         # DEPTH LOSS (MASKED + Z-BUFFERED)
+    #         # -----------------------------------------
+    #         loss_depth = self.compute_depth_loss(
+    #             vertices=vertices,
+    #             cam_intrinsics=cam_intrinsics_torch[0],
+    #             depth_map=depth_map_torch,
+    #             mask=mask_torch,
+    #             max_verts=3000,
+    #             it=it
+    #         )
+
+    #         # -----------------------------------------
+    #         # Regularization (VERY IMPORTANT)
+    #         # -----------------------------------------
+    #         loss_pose = torch.mean(body_pose ** 2)
+    #         loss_shape = torch.mean(betas ** 2)
+
+    #         loss = (
+    #             1.0 * loss_depth +
+    #             0.01 * loss_pose +
+    #             0.1 * loss_shape
+    #         )
+
+    #         loss.backward()
+    #         optimizer.step()
+
+    #         if it % 25 == 0:
+    #             print(
+    #                 f"[P2] {it:04d} | "
+    #                 f"Depth: {loss_depth.item():.4f} | "
+    #                 f"Pose: {loss_pose.item():.6f} | "
+    #                 f"Shape: {loss_shape.item():.6f}"
+    #             )
+
+    #     # -----------------------------------------
+    #     # Store refined parameters
+    #     # -----------------------------------------
+    #     self.fitted_params = {
+    #         'transl': transl.detach(),
+    #         'global_orient': global_orient.detach(),
+    #         'body_pose': body_pose.detach(),
+    #         'betas': betas.detach(),
+    #         'left_hand_pose': left_hand_pose,
+    #         'right_hand_pose': right_hand_pose,
+    #         'expression': expression,
+    #     }
+
+    #     return self.fitted_params
+
 
         
     
