@@ -29,6 +29,8 @@ input_images*/
 files/
 Depth-Anything-3/
 *.pt
+input/
+external/
 
 # Jupyter notebooks
 .ipynb_checkpoints

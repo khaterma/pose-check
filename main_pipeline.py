@@ -14,6 +14,7 @@ from depth_anything_3.api import DepthAnything3
 from fov_estimator import FOVEstimator
 from sam3.model_builder import build_sam3_image_model
 from sam3.model.sam3_image_processor import Sam3Processor
+from rvh_fitter import RVHSMPLXFitter
 from metric_smpl_fitter import MetricSMPLFitter
 from smpl_visualization import (
     visualize_fitting_results,
@@ -22,6 +23,9 @@ from smpl_visualization import (
 )
 from utils import project_to_3d, lift2d_keypoints_to_3d
 import open3d as o3d
+from vitpose import infer_pose
+from nlf import NLFSMPLFitter
+
 
 
 BODY_PARTS = {
@@ -67,17 +71,20 @@ class BodyReconstructionPipeline:
         self.cam_intrinsics = cam_intrinsics
         
         # Step 2: 2D Pose Detection
-        keypoints_2d = self._detect_pose_2d(image_path, processed_image)
+        # keypoints_2d = self._detect_pose_2d(image_path, processed_image)
+        keypoints_2d = infer_pose(processed_image)
         
         # Step 3: Segmentation (SAM3)
         masks, boxes, scores = self._generate_segmentation_masks(processed_image)
         
         # Step 4: Create 3D Point Cloud
-        point_cloud_array, pcd = self._create_point_cloud(depth_map, processed_image)
+        point_cloud_array, pcd = self._create_point_cloud(depth_map, processed_image, sam_mask=masks[0])
         
         # Clean up GPU memory before fitting
         self._cleanup_gpu()
         
+
+        print(" Inferred NLF model ")
         # Step 5: SMPL-X Fitting
         fitted_params = self._fit_smplx_model(
             processed_image,
@@ -86,27 +93,28 @@ class BodyReconstructionPipeline:
             cam_intrinsics,
             point_cloud_array,
             gender, 
-            masks
+            masks, 
+            # self.masks_feet
         )
         
-        # Step 6: Generate Visualizations (optional)
-        if enable_visualization and fitted_params is not None:
-            self._generate_visualizations(
-                processed_image,
-                cam_intrinsics,
-                point_cloud_array,
-                fitted_params
-            )
+        # # Step 6: Generate Visualizations (optional)
+        # if enable_visualization and fitted_params is not None:
+        #     self._generate_visualizations(
+        #         processed_image,
+        #         cam_intrinsics,
+        #         point_cloud_array,
+        #         fitted_params
+        #     )
         
-        return {
-            "depth_map": depth_map,
-            "processed_image": processed_image,
-            "cam_intrinsics": cam_intrinsics,
-            "keypoints_2d": keypoints_2d,
-            "masks": masks,
-            "point_cloud": point_cloud_array,
-            "fitted_params": fitted_params
-        }
+        # return {
+        #     "depth_map": depth_map,
+        #     "processed_image": processed_image,
+        #     "cam_intrinsics": cam_intrinsics,
+        #     "keypoints_2d": keypoints_2d,
+        #     "masks": masks,
+        #     "point_cloud": point_cloud_array,
+        #     "fitted_params": fitted_params
+        # }
     
     def _estimate_depth_and_fov(self, image_path):
         """Step 1: Estimate depth map and camera FOV."""
@@ -127,6 +135,10 @@ class BodyReconstructionPipeline:
             self.fov_estimator = FOVEstimator(name="moge2", device=self.device)
         
         cam_intrinsics = self.fov_estimator.get_cam_intrinsics(img=processed_image)
+
+        # # flip the sign of fx and fy
+        # cam_intrinsics[0,0,0] = cam_intrinsics[0,0,0] # flip fx, fy to ensure the right direction for smplx fitting
+        # cam_intrinsics[0,1,1] = cam_intrinsics[0,1,1]
         
         print(f"✓ Depth map shape: {depth_map.shape}")
         print(f"✓ Camera intrinsics estimated")
@@ -193,9 +205,20 @@ class BodyReconstructionPipeline:
         masks = output["masks"]
         boxes = output["boxes"]
         scores = output["scores"]
+
+        feet_Segment = self.sam_processor.set_text_prompt(
+            state=inference_state,
+            prompt="human feet"
+        )
+        self.masks_feet = feet_Segment["masks"]
+        self.boxes_feet = feet_Segment["boxes"]
+        self.scores_feet = feet_Segment["scores"]
+        
         
         # Save mask visualizations
         self._save_mask_visualizations(processed_image, masks, scores)
+        self._save_mask_visualizations(processed_image, self.masks_feet, self.scores_feet)
+        print(f"✓ Generated {len(self.masks_feet)} feet mask(s)")
         
         print(f"✓ Generated {len(masks)} mask(s)")
         return masks, boxes, scores
@@ -219,7 +242,7 @@ class BodyReconstructionPipeline:
             )
             plt.close()
     
-    def _create_point_cloud(self, depth_map, rgb_image):
+    def _create_point_cloud(self, depth_map, rgb_image, sam_mask=None, clean_point_cloud=True):
         """Step 4: Create 3D point cloud from depth map."""
         print("\n[4/5] Creating 3D point cloud...")
         
@@ -227,14 +250,29 @@ class BodyReconstructionPipeline:
             depth_map=depth_map,
             img_rgb=rgb_image,
             camera_intrinsics=self.cam_intrinsics,
-            center_around_origin=True
+            sam_mask=sam_mask
         )
         
         pcd = o3d.geometry.PointCloud()
         pcd.points = o3d.utility.Vector3dVector(points)
         pcd.colors = o3d.utility.Vector3dVector(colors)
-        point_cloud_array = np.asarray(pcd.points)
         
+        if clean_point_cloud:
+            # Apply DBSCAN clustering to remove outliers
+            print("  Applying DBSCAN clustering to clean point cloud...")
+            labels = np.array(pcd.cluster_dbscan(eps=0.05, min_points=10, print_progress=False))
+            
+            # Keep only the largest cluster
+            if len(labels) > 0 and labels.max() >= 0:
+                unique_labels, counts = np.unique(labels[labels >= 0], return_counts=True)
+                largest_cluster_label = unique_labels[np.argmax(counts)]
+                mask = labels == largest_cluster_label
+                
+                pcd = pcd.select_by_index(np.where(mask)[0])
+                print(f"  ✓ Removed {np.sum(~mask)} outlier points, kept {np.sum(mask)} points")
+            
+        point_cloud_array = np.asarray(pcd.points)
+            
         # Save point cloud
         o3d.io.write_point_cloud(os.path.join(self.output_dir, "point_cloud.ply"), pcd)
         
@@ -268,23 +306,59 @@ class BodyReconstructionPipeline:
             return None
         
         try:
-            # Initialize fitter
-            fitter = MetricSMPLFitter(
-                smplx_model_path="./data/smplx",
-                gender=gender,
-                device=str(self.device),
-                image=image
-            )
-            
-            # Run fitting
+            fitter = NLFSMPLFitter(image=image)
+
             final_params = fitter.fit(
                 keypoints_2d=keypoints_2d,
                 cam_intrinsics=cam_intrinsics.cpu().numpy(),
                 depth_map=depth_map,
                 point_cloud=point_cloud,
                 mask=masks[0].cpu().numpy(),
+                feet_mask=self.masks_feet.cpu().numpy(),
                 conf_threshold=0.5
             )
+            params = final_params
+            # project mesh on image 
+            projected_image = fitter.project_mesh_on_image(final_params, image, cam_intrinsics)
+            cv2.imwrite(os.path.join(self.output_dir, "projected_mesh_on_image.png"), projected_image)
+
+            optimize_metric = fitter.run_metric_optimization(cam_intrinsics, point_cloud)
+            print("✓ NLF SMPL fitting complete")
+
+
+
+
+
+            # Initialize fitter (RVH-style multi-stage optimization)
+            # fitter = RVHSMPLXFitter(
+            #     smplx_model_path="./data/smplx",
+            #     gender=gender,
+            #     device=str(self.device),
+            #     image=image, 
+            #     vposer_model_path="./data/vposer_v2_05", 
+            #     use_vposer=True,
+            #     debug=False
+            # )
+
+            # fitter = MetricSMPLFitter(
+            #     smplx_model_path="./data/smplx",
+            #     gender=gender,
+            #     device=str(self.device),
+            #     image=image
+            # )
+
+
+            
+            # # Run fitting
+            # final_params = fitter.fit(
+            #     keypoints_2d=keypoints_2d,
+            #     cam_intrinsics=cam_intrinsics.cpu().numpy(),
+            #     depth_map=depth_map,
+            #     point_cloud=point_cloud,
+            #     mask=masks[0].cpu().numpy(),
+            #     feet_mask=self.masks_feet.cpu().numpy(),
+            #     conf_threshold=0.5
+            # )
             
             # final_params = fitter.optimize_phase2(
             #     depth_map=depth_map,

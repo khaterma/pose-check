@@ -4,7 +4,9 @@ Adjust these settings to customize the reconstruction pipeline.
 """
 
 # Input/Output Settings
-INPUT_IMAGE = "/home/khater/pose-check/tom.jpg"
+# INPUT_IMAGE = "/home/khater/pose-check/tom.jpg"
+# INPUT_IMAGE = "omar3.jpg"
+INPUT_IMAGE = "mohamed.jpg"
 OUTPUT_DIR = "output"
 
 # Model Settings
