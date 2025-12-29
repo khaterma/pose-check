@@ -1,0 +1,29 @@
+# # Core dependencies for Metric SMPL-X Fitting
+# torch>=2.0.0
+# torchvision>=0.15.0
+# numpy>=1.21.0
+# opencv-python>=4.5.0
+# scipy>=1.7.0
+
+# SMPL-X model
+# smplx>=0.1.28
+
+# PyTorch3D for chamfer distance and rendering
+# Install via: pip install "git+https://github.com/facebookresearch/pytorch3d.git"
+# or conda install pytorch3d -c pytorch3d
+pytorch3d
+
+# Segment Anything (Optional - for better person masks)
+# Install via: pip install git+https://github.com/facebookresearch/segment-anything.git
+# segment-anything
+
+# VPoser (Optional - for better pose prior)
+# Install via: pip install git+https://github.com/nghorbani/human_body_prior
+# human_body_prior
+
+# 3D mesh export
+# trimesh>=3.9.0
+
+# Existing dependencies
+ultralytics  # YOLO-Pose
+open3d>=0.15.0  # Point cloud
